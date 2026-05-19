@@ -26,7 +26,6 @@
 #include "gc/shared/workerThread.hpp"
 #include "logging/log.hpp"
 #include "memory/iterator.hpp"
-#include "runtime/atomicAccess.hpp"
 #include "runtime/init.hpp"
 #include "runtime/java.hpp"
 #include "runtime/os.hpp"
@@ -40,6 +39,8 @@ WorkerTaskDispatcher::WorkerTaskDispatcher() :
     _end_semaphore() {}
 
 void WorkerTaskDispatcher::coordinator_distribute_task(WorkerTask* task, uint num_workers) {
+  guarantee(num_workers > 0, "must use at least one worker, deadlocks otherwise");
+
   // No workers are allowed to read the state variables until they have been signaled.
   _task = task;
   _not_finished.store_relaxed(num_workers);
@@ -96,8 +97,22 @@ void WorkerThreads::initialize_workers() {
   }
 }
 
+bool WorkerThreads::allow_inject_creation_failure() const {
+  if (!is_init_completed()) {
+    // Never allow creation failures during VM init
+    return false;
+  }
+
+  if (_created_workers == 0) {
+    // Never allow creation failures of the first worker, it will cause the VM to exit
+    return false;
+  }
+
+  return true;
+}
+
 WorkerThread* WorkerThreads::create_worker(uint name_suffix) {
-  if (is_init_completed() && InjectGCWorkerCreationFailure) {
+  if (InjectGCWorkerCreationFailure && allow_inject_creation_failure()) {
     return nullptr;
   }
 
@@ -116,9 +131,9 @@ WorkerThread* WorkerThreads::create_worker(uint name_suffix) {
 }
 
 uint WorkerThreads::set_active_workers(uint num_workers) {
-  assert(num_workers > 0 && num_workers <= _max_workers,
-         "Invalid number of active workers %u (should be 1-%u)",
-         num_workers, _max_workers);
+  guarantee(num_workers > 0 && num_workers <= _max_workers,
+            "Invalid number of active workers %u (should be 1-%u)",
+            num_workers, _max_workers);
 
   while (_created_workers < num_workers) {
     WorkerThread* const worker = create_worker(_created_workers);
@@ -197,8 +212,6 @@ WorkerThread::WorkerThread(const char* name_prefix, uint name_suffix, WorkerTask
 }
 
 void WorkerThread::run() {
-  os::set_priority(this, NearMaxPriority);
-
   while (true) {
     _dispatcher->worker_run_task();
   }

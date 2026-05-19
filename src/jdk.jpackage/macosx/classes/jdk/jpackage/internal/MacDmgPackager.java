@@ -32,9 +32,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
-import java.text.MessageFormat;
 import java.util.ArrayList;
-import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -47,6 +45,7 @@ import jdk.jpackage.internal.PackagingPipeline.TaskID;
 import jdk.jpackage.internal.model.MacDmgPackage;
 import jdk.jpackage.internal.util.FileUtils;
 import jdk.jpackage.internal.util.PathGroup;
+import jdk.jpackage.internal.util.RootedPath;
 
 record MacDmgPackager(BuildEnv env, MacDmgPackage pkg, Path outputDir,
         MacDmgSystemEnvironment sysEnv) implements Consumer<PackagingPipeline.Builder> {
@@ -61,7 +60,6 @@ record MacDmgPackager(BuildEnv env, MacDmgPackage pkg, Path outputDir,
     @Override
     public void accept(PackagingPipeline.Builder pipelineBuilder) {
         pipelineBuilder
-                .excludeDirFromCopying(outputDir)
                 .task(DmgPackageTaskID.COPY_DMG_CONTENT)
                         .action(this::copyDmgContent)
                         .addDependent(PackageTaskID.CREATE_PACKAGE_FILE)
@@ -105,7 +103,7 @@ record MacDmgPackager(BuildEnv env, MacDmgPackage pkg, Path outputDir,
         return env.configDir().resolve(pkg.app().name() + "-volume.icns");
     }
 
-    Path licenseFile() {
+    Path licensePListFile() {
         return env.configDir().resolve(pkg.app().name() + "-license.plist");
     }
 
@@ -131,9 +129,7 @@ record MacDmgPackager(BuildEnv env, MacDmgPackage pkg, Path outputDir,
 
     private void copyDmgContent() throws IOException {
         final var srcFolder = env.appImageDir();
-        for (Path path : pkg.content()) {
-            FileUtils.copyRecursive(path, srcFolder.resolve(path.getFileName()));
-        }
+        RootedPath.copy(pkg.dmgRootDirSources().stream(), srcFolder);
     }
 
     private Executor hdiutil(String... args) {
@@ -142,9 +138,7 @@ record MacDmgPackager(BuildEnv env, MacDmgPackage pkg, Path outputDir,
 
     private void prepareDMGSetupScript() throws IOException {
         Path dmgSetup = volumeScript();
-        Log.verbose(MessageFormat.format(
-                I18N.getString("message.preparing-dmg-setup"),
-                dmgSetup.toAbsolutePath().toString()));
+        Log.progress(I18N.format("message.preparing-dmg-setup", dmgSetup.toAbsolutePath().toString()));
 
         // Prepare DMG setup script
         Map<String, String> data = new HashMap<>();
@@ -175,26 +169,6 @@ record MacDmgPackager(BuildEnv env, MacDmgPackage pkg, Path outputDir,
                 .saveToFile(dmgSetup);
     }
 
-    private void prepareLicense() throws IOException {
-        final var licFile = pkg.licenseFile();
-        if (licFile.isEmpty()) {
-            return;
-        }
-
-        byte[] licenseContentOriginal =
-                Files.readAllBytes(licFile.orElseThrow());
-        String licenseInBase64 =
-                Base64.getEncoder().encodeToString(licenseContentOriginal);
-
-        Map<String, String> data = new HashMap<>();
-        data.put("APPLICATION_LICENSE_TEXT", licenseInBase64);
-
-        env.createResource(DEFAULT_LICENSE_PLIST)
-                .setCategory(I18N.getString("resource.license-setup"))
-                .setSubstitutionData(data)
-                .saveToFile(licenseFile());
-    }
-
     private void prepareConfigFiles() throws IOException {
 
         env.createResource(DEFAULT_BACKGROUND_IMAGE)
@@ -206,7 +180,9 @@ record MacDmgPackager(BuildEnv env, MacDmgPackage pkg, Path outputDir,
                 .setExternal(pkg.icon().orElse(null))
                 .saveToFile(volumeIcon());
 
-        prepareLicense();
+        if (pkg.licenseFile().isPresent()) {
+            MacDmgLicense.prepareLicensePListFile(pkg.licenseFile().get(), licensePListFile());
+        }
 
         prepareDMGSetupScript();
     }
@@ -223,10 +199,6 @@ record MacDmgPackager(BuildEnv env, MacDmgPackage pkg, Path outputDir,
         }
     }
 
-    private String hdiUtilVerbosityFlag() {
-        return env.verbose() ? "-verbose" : "-quiet";
-    }
-
     private void buildDMG() throws IOException {
         boolean copyAppImage = false;
 
@@ -235,21 +207,10 @@ record MacDmgPackager(BuildEnv env, MacDmgPackage pkg, Path outputDir,
 
         final Path srcFolder = env.appImageDir();
 
-        Log.verbose(MessageFormat.format(I18N.getString(
-                "message.creating-dmg-file"), finalDMG.toAbsolutePath()));
-
-        try {
-            Files.deleteIfExists(finalDMG);
-        } catch (IOException ex) {
-            throw new IOException(MessageFormat.format(I18N.getString(
-                    "message.dmg-cannot-be-overwritten"),
-                    finalDMG.toAbsolutePath()));
-        }
-
         Files.createDirectories(protoDMG.getParent());
         Files.createDirectories(finalDMG.getParent());
 
-        final String hdiUtilVerbosityFlag = hdiUtilVerbosityFlag();
+        final String hdiUtilVerbosityFlag = "-verbose";
 
         // create temp image
         try {
@@ -261,7 +222,9 @@ record MacDmgPackager(BuildEnv env, MacDmgPackage pkg, Path outputDir,
                     "-fs", "HFS+",
                     "-format", "UDRW").executeExpectSuccess();
         } catch (IOException ex) {
-            Log.verbose(ex); // Log exception
+            Log.trace(ex, "Failed to create a DMG from the entire app image");
+
+            Log.trace("Will create an empty DMG and fill it manually");
 
             // Creating DMG from entire app image failed, so lets try to create empty
             // DMG and copy files manually. See JDK-8248059.
@@ -317,7 +280,7 @@ record MacDmgPackager(BuildEnv env, MacDmgPackage pkg, Path outputDir,
                 .timeout(3, TimeUnit.MINUTES)
                 .executeExpectSuccess();
             } catch (IOException ex) {
-                Log.verbose(ex);
+                Log.trace(ex, "Failed to set background image");
             }
 
             // volume icon
@@ -349,11 +312,10 @@ record MacDmgPackager(BuildEnv env, MacDmgPackage pkg, Path outputDir,
                             normalizedAbsolutePathString(mountedVolume)
                     ).executeExpectSuccess();
                 } catch (IOException ex) {
-                    Log.error(ex.getMessage());
-                    Log.verbose("Cannot enable custom icon using SetFile utility");
+                    Log.trace(ex, "Failed to set custom icon");
                 }
             } else {
-                Log.verbose(I18N.getString("message.setfile.dmg"));
+                Log.progress(I18N.format("message.setfile.dmg"));
             }
 
         } finally {
@@ -370,24 +332,14 @@ record MacDmgPackager(BuildEnv env, MacDmgPackage pkg, Path outputDir,
                     "udifrez",
                     normalizedAbsolutePathString(finalDMG),
                     "-xml",
-                    normalizedAbsolutePathString(licenseFile())
+                    normalizedAbsolutePathString(licensePListFile())
             ).retry()
                     .setMaxAttemptsCount(10)
                     .setAttemptTimeout(3, TimeUnit.SECONDS)
                     .execute();
         }
 
-        try {
-            //Delete the temporary image
-            Files.deleteIfExists(protoDMG);
-        } catch (IOException ex) {
-            // Don't care if fails
-        }
-
-        Log.verbose(MessageFormat.format(I18N.getString(
-                "message.output-to-location"),
-                pkg.app().name(), normalizedAbsolutePathString(finalDMG)));
-
+        IOUtils.deleteIfExistsIgnoreError(protoDMG);
     }
 
     private void detachVolume() throws IOException {
@@ -406,7 +358,7 @@ record MacDmgPackager(BuildEnv env, MacDmgPackage pkg, Path outputDir,
             }
 
             cmdline.addAll(List.of(
-                    hdiUtilVerbosityFlag(),
+                    "-verbose",
                     normalizedAbsolutePathString(mountedVolume)
             ));
 
@@ -429,7 +381,7 @@ record MacDmgPackager(BuildEnv env, MacDmgPackage pkg, Path outputDir,
             return hdiutil(
                     "convert",
                     normalizedAbsolutePathString(srcDmg),
-                    hdiUtilVerbosityFlag(),
+                    "-verbose",
                     "-format", "UDZO",
                     "-o", normalizedAbsolutePathString(finalDmg()));
         };
@@ -441,14 +393,17 @@ record MacDmgPackager(BuildEnv env, MacDmgPackage pkg, Path outputDir,
                 .setAttemptTimeout(3, TimeUnit.SECONDS)
                 .execute();
         } catch (IOException ex) {
-            Log.verbose(ex);
+            Log.trace(ex, "Failed to convert an interim DMG into the output DMG");
+
+            Log.trace("Try to convert a copy of an interim DMG into the output DMG");
+
             // Something holds the file, try to convert a copy.
             Path copyDmg = protoCopyDmg();
             Files.copy(protoDmg(), copyDmg);
             try {
                 convert.apply(copyDmg).executeExpectSuccess();
             } finally {
-                Files.deleteIfExists(copyDmg);
+                IOUtils.deleteIfExistsIgnoreError(copyDmg);
             }
         }
     }
@@ -457,6 +412,4 @@ record MacDmgPackager(BuildEnv env, MacDmgPackage pkg, Path outputDir,
     private static final String DEFAULT_BACKGROUND_IMAGE = "background_dmg.tiff";
     private static final String DEFAULT_DMG_SETUP_SCRIPT = "DMGsetup.scpt";
     private static final String TEMPLATE_BUNDLE_ICON = "JavaApp.icns";
-
-    private static final String DEFAULT_LICENSE_PLIST="lic_template.plist";
 }

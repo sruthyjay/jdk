@@ -115,6 +115,13 @@ public record CommandActionSpecs(List<CommandActionSpec> specs) {
             return printToStderr(List.of(str));
         }
 
+        public Builder argsListener(Consumer<List<String>> listener) {
+            Objects.requireNonNull(listener);
+            return action(CommandActionSpec.create("args-listener", context -> {
+                listener.accept(context.args());
+            }));
+        }
+
         public Builder exit(int exitCode) {
             return action(CommandActionSpec.create(String.format("exit(%d)", exitCode), () -> {
                 return exitCode;
@@ -126,22 +133,19 @@ public record CommandActionSpecs(List<CommandActionSpec> specs) {
         }
 
         public Builder exit(CommandMockExit exit) {
-            switch (exit) {
+            return switch (exit) {
                 case SUCCEED -> {
-                    return exit();
+                    yield exit();
                 }
                 case EXIT_1 -> {
-                    return exit(1);
+                    yield exit(1);
                 }
                 case THROW_MOCK_IO_EXCEPTION -> {
-                    return action(CommandActionSpec.create("<I/O error>", () -> {
+                    yield action(CommandActionSpec.create("<I/O error>", () -> {
                         throw new MockingToolProvider.RethrowableException(new MockIOException("Kaput!"));
                     }));
                 }
-                default -> {
-                    throw ExceptionBox.reachedUnreachable();
-                }
-            }
+            };
         }
 
         public Builder mutate(Consumer<Builder> mutator) {
